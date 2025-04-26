@@ -4,14 +4,12 @@
 #include <stdio.h>
 #include <string.h>
 #include "raylib.h"
-#include "rlgl.h"
 #include <math.h>
 #include <string.h>
 #include <stdio.h>
 #include <stdbool.h>
 #include <stdlib.h>
 #include <unistd.h>
-#include <wchar.h>
 #include <locale.h>
 #include <pthread.h>
 #include <sched.h>
@@ -19,29 +17,62 @@
 #include <signal.h>
 #include <termios.h>
 
+// 画面のサイズ1920x1920
 #define SCREEN_WIDTH 1920
 #define SCREEN_HEIGHT 1080
-#define BG1_WIDTH 240
-#define BG2_WIDTH 30
-#define MAX_LOG 22
-#define TRAJECTORY_LENGTH 15
-#define LINE_HEIGHT 36
-#define STATUS_Y (LINE_HEIGHT * 2)
-#define LOG_X 80
-#define LOG_Y (LINE_HEIGHT * 3)
+
+// 左右のログ表示エリアの透過グラデーション領域の幅
+// 濃い目のグラデーションで入力を強調して見栄え用に透過を強めて終端させる
+#define BG1_WIDTH 240 // メイン領域幅
+#define BG2_WIDTH 30  // 見栄え用の終端グラデーション幅
+
+#define MAX_LOG 22        // 最大入力ログ表示数。画面の縦幅に併せた件数にする
+#define MAX_TRAJECTORY 15 // 最大レバー軌跡数。描画の負担にならない程度にする
+#define LINE_HEIGHT 36    // 行高さ。フォントサイズと調整した高さにする
+
+// レバー軌跡とボタン状態の表示オフセット
+#define STATUS_X1 80   // 1Pログ表示の左端
+#define STATUS_X2 1680 // 2Pログ表示の左端
+#define STATUS_Y 980   // 1P2P共通の上端
+
+// ログ表示オフセット
+#define LOG_X1 40                 // 1Pログ表示の左端
+#define LOG_X2 1860               // 2Pログ表示の左端
+#define LOG_X_FIX 80              // ログ表示の個別の補正幅
+#define LOG_Y (LINE_HEIGHT * 3.5) // 1P2P共通の上端
 #define MAX_FRAME_COUNT 1000
+#define RESET_FRAME_COUNT 1800 // 30秒間無操作（約1800フレーム）でリセット
 
-#define COUNT_CACHE_SIZE 1001
-#define DIR_STATE_COUNT 16
-#define BTN_STATE_COUNT 16
+// 文字のコードポイントキャッシュ数
+#define COUNT_CACHE_SIZE 1001 // フレームカウント文字列000～999およびLOTのキャッシュ数
+#define DIR_STATE_COUNT 16    // レバー状態ビット構成の0～Fにあわせた上下左右文字のキャッシュ数
+#define BTN_STATE_COUNT 16    // ボタン状態ビット構成の0～Fにあわせた上下左右文字のキャッシュ数
+// レバー状態もしくはボタン状態のビット列は次の仕様になります
+// 0 0 0 0
+// | | | |       stick  button
+// | | | |       ------ ------
+// | | | `-- 0x1 UP     A
+// | | `---- 0x2 DOWN   B
+// | `------ 0x4 LEFT   C
+// `-------- 0x8 RIGHT  D
 
+// 文字表示関数用の寄せ方向
 #define LEFT 0
 #define RIGHT 1
 #define CENTER 2
 
+// ロックファイル
+#define LOCK_FILE_PATH "/tmp/input_dispi.lock"
+
 // ・↖↗↙↘ が収録されているフォント
 #define FONT_PATH "fonts/InputDispi.otf"
 #define FONT_SIZE 32
+
+// 状態表示で使う文字サイズと連動したボタンサイズ
+#define BTN_SIZE (FONT_SIZE * 0.5625) // ボタンサイズ
+#define BTN_Y_FIX (FONT_SIZE * 0.4)   // 文字表示位置の補正値
+
+static Font font; // 全体共通のフォント変数
 
 // ロックファイル用ファイルディスクリプタ（多重起動防止機能で使用）
 static int lock_fd = -1;
@@ -49,21 +80,40 @@ static int lock_fd = -1;
 /**
  * @brief プログラム起動時にロックファイルを作成し排他ロックを取得する。
  *        すでにロック取得済みなら多重起動と判断してエラー終了する。
+ *        ただし、取得失敗したときに古いロックファイルを削除して1回だけリトライし、
+ *        それでも取れなければエラー終了する。
+ *        これにより、たまたま残っていたロックファイルによる起動失敗を防げ、
+ *        ユーザーがいちいちロックファイルを手で消す必要がない振る舞いをします。
  */
-static void acquire_lock_or_exit(void)
+void acquire_lock_or_exit(void)
 {
-    lock_fd = open("/var/lock/input_dispi.lock", O_CREAT | O_RDWR, 0666);
-    if (lock_fd < 0)
+    lock_fd = open(LOCK_FILE_PATH, O_RDWR | O_CREAT, 0666);
+    if (lock_fd == -1)
     {
-        perror("open lock file failed");
+        perror("open (lock file)");
         exit(EXIT_FAILURE);
     }
 
-    if (flock(lock_fd, LOCK_EX | LOCK_NB) < 0)
+    if (flock(lock_fd, LOCK_EX | LOCK_NB) == -1)
     {
-        fprintf(stderr, "Another instance of input_dispi is already running.\n");
+        // まず警告
+        perror("flock (lock file) - retrying after cleanup");
+
+        // ロックファイル強制削除→リトライ
+        unlink(LOCK_FILE_PATH);
         close(lock_fd);
-        exit(EXIT_FAILURE);
+
+        lock_fd = open(LOCK_FILE_PATH, O_RDWR | O_CREAT, 0666);
+        if (lock_fd == -1)
+        {
+            perror("re-open (lock file)");
+            exit(EXIT_FAILURE);
+        }
+        if (flock(lock_fd, LOCK_EX | LOCK_NB) == -1)
+        {
+            perror("flock (lock file) after retry");
+            exit(EXIT_FAILURE);
+        }
     }
 }
 
@@ -121,13 +171,30 @@ static void reset_terminal_mode(void)
     }
 }
 
+// raylibのテキスト描画はコードポイントを事前に登録してそこから文字列を指定する
+// 必要になるテキストを事前に用意しておきユニークなコードポイント列として保存する
 static char *text = "•・↖↗↙↘↑↓←→ABCD0123456789LOTあいうえお";
-static bool show_debug = false;
-static bool rt_debug_state = false;
-static bool delete_requested = false;
-static bool debug_triggered = false;
-static bool prev_debug_state = false;
 
+// デバッグ表示はスタート+セレクト同時押しのトグル方式になるため
+// トグル用に前回状態を保存することと
+// 入力検知からの状態変更、表示スレッドへ順に連携させていく必要がある
+static bool show_debug = false; // デバッグ状態のフラグ本体
+static bool rt_debug_state = false; // 入力検知時のバッファ
+static bool debug_triggered = false; // 更新トリガー用のバッファ
+static bool prev_debug_state = false; // 前回状態
+
+// レバー状態とボタン状態と継続フレームカウントの構造体
+// コードポイントキャッシュから文字列を解決するためのインデックスと有限カウンタでの構成としている。
+typedef struct
+{
+    unsigned char dir_index : 4;   // 上下左右状態のビット値を合成した計算省略用フィールド
+    unsigned char btn_index : 4;   // ABCD状態のビット値を合成した計算省略用フィールド
+    unsigned short int count : 10; // フレームカウント0-1000まで
+} LogState;
+
+// 入力検知用状態フラグ構造体
+// 1000Hzで動作する入力検知用スレッドで高速に更新をしていくため単純なON/OFF構成にしている。
+// 状態管理スレッドでフラグ判定からのビット加算してLogStateへ変換するために利用する。
 typedef struct
 {
     unsigned char up : 1;
@@ -138,23 +205,41 @@ typedef struct
     unsigned char b : 1;
     unsigned char c : 1;
     unsigned char d : 1;
-    unsigned char dir_index : 4; // 上下左右状態のビット値を合成した計算省略用フィールド
-    unsigned char btn_index : 4;  // ABCD状態のビット値を合成した計算省略用フィールド
-    unsigned short int count : 10; // フレームカウント0-1000まで
 } InputState;
 
 /**
  * @brief 各ビット値の合計フィールドを比較して同値なら真値を返す。
  */
-static inline bool is_equal_state(const InputState *a, const InputState *b)
+static inline bool is_neutral(const LogState *a)
+{
+    return a->dir_index == 0 && a->btn_index == 0;
+}
+
+/**
+ * @brief 各ビット値の合計フィールドを比較して同値なら真値を返す。
+ */
+static inline bool is_equal_state(const LogState *a, const LogState *b)
 {
     return a->dir_index == b->dir_index && a->btn_index == b->btn_index;
 }
 
+// 文字キャッシュ構造体
+// 文字列を逐次コードポイントに変換して使用後に破棄すると非効率であるため
+// 事前に使用するすべての文字パターンをキャッシュとして保持するようにする。
+// 描画に必要なコードポイントとその長さで構成している。
+// 元文字列を保持しているのはコードポイントではなく文字列そのものを要求する関数の利用があるため。
+// レバー状態とボタンの組み合わせが上限となるため文字列長は短めで設定している。
+// 
+// [入力ログ表示の仕様]
+// 000 →ABCD
+// ~~~ ~~~~~~
+//  |   |
+//  |   `----- 最大5文字: レバー状態とボタンの組み合わせ
+//  `--------- 最大3文字: 000～999もしくはLOT
 typedef struct
 {
-    char text[8]; // 元文字列
-    int *codepoints; // 文字列と一致するコードポイントバッファ
+    char text[5];        // 元文字列
+    int *codepoints;     // 文字列と一致するコードポイントバッファ
     int codepoint_count; // コードポイント数=文字数
 } CachedText;
 
@@ -172,12 +257,12 @@ static CachedText button_cache[BTN_STATE_COUNT];
 static void init_codepoint_cache()
 {
     char buf[8];
-    for (int i = 0; i < 1000; i++)
+    for (int i = 0; i < MAX_FRAME_COUNT; i++)
     {
         snprintf(buf, sizeof(buf), "%03d", i);
         init_cached_text(&count_cache[i], buf);
     }
-    init_cached_text(&count_cache[1000], "LOT");
+    init_cached_text(&count_cache[MAX_FRAME_COUNT], "LOT");
 
     const char *nt = "•", *up = "↑", *down = "↓", *left = "←", *right = "→",
                *ul = "↖", *ur = "↗", *dl = "↙", *dr = "↘";
@@ -236,24 +321,21 @@ static void cleanup_codepoint_cache()
 
 static pthread_mutex_t input_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t state_lock = PTHREAD_MUTEX_INITIALIZER;
-// ティアリング検知用バッファ
-InputState lastDrawnState1 = {0}, lastDrawnState2 = {0};
 
 // 状態更新スレッドと入力検知スレッド用の中間バッファ
 static InputState realtime_state1 = {0}, realtime_state2 = {0};
 static bool cur_debug_state = false;
 
 // 描画スレッドと状態更新スレッド用の中間バッファ
-static InputState drawable_state1 = {0}, drawable_state2 = {0};
-static int drawable_count1 = 1, drawable_count2 = 1;
-static InputState drawable_traj1[TRAJECTORY_LENGTH] = {0};
-static InputState drawable_traj2[TRAJECTORY_LENGTH] = {0};
-static InputState drawableLogP1[MAX_LOG] = {0};
-static InputState drawableLogP2[MAX_LOG] = {0};
-static bool drawable1, drawable2;
-
-static Font font;
-static Font font2;
+// 軌跡と入力ログは固定長配列。
+// 添え字が少ないほど最新のもので入力ログの最新データはカウントアップされていく。
+// フラグにより1P、2Pそれぞれの描画有無を制御する。
+// 一定時間入力がない場合はデータ初期化のうえ描画を抑制して可視性をよくする。
+static unsigned int drawable_traj1[MAX_TRAJECTORY] = {0}; // 1P 軌跡データ
+static unsigned int drawable_traj2[MAX_TRAJECTORY] = {0}; // 2P 軌跡データ
+static LogState drawable_log1[MAX_LOG] = {0};             // 1P 入力ログデータ
+static LogState drawable_log2[MAX_LOG] = {0};             // 2P 入力ログデータ
+static bool drawable1, drawable2;                         // 描画するかどうかのbool値
 
 /**
  * @brief 文字表示用のユーティリティです。
@@ -274,53 +356,62 @@ static void draw_text(const CachedText *c, int x, int y, int align)
 /**
  * @brief レバーとボタンおよびフレームカウントの入力ログを表示する。
  */
-static void draw_logs(const InputState *states, int x, int baseY, int align_right, int len)
+static void draw_logs(const LogState *log, int x, int baseY, int align_right, int len)
 {
     for (int i = 0; i < len; ++i)
     {
-        if (states[i].count == 0)
+        if (log[i].count == 0)
             continue;
 
-        CachedText *direction = &dir_cache[states[i].dir_index];
-        CachedText *buttons = &button_cache[states[i].btn_index];
+        CachedText *direction = &dir_cache[log[i].dir_index];
+        CachedText *buttons = &button_cache[log[i].btn_index];
         int y = baseY + i * LINE_HEIGHT;
 
         if (align_right)
         {
-            int dx = x - LOG_X;
+            int dx = x - LOG_X_FIX;
             Vector2 btnSize = MeasureTextEx(font, buttons->text, FONT_SIZE, 1);
-            draw_text(direction, dx - btnSize.x, y, RIGHT);        // 方向
-            draw_text(buttons, dx, y, RIGHT);                      // ボタン
-            draw_text(&count_cache[states[i].count], x, y, RIGHT); // フレームカウント
+            draw_text(direction, dx - btnSize.x, y, RIGHT);     // 方向
+            draw_text(buttons, dx, y, RIGHT);                   // ボタン
+            draw_text(&count_cache[log[i].count], x, y, RIGHT); // フレームカウント
         }
         else
         {
-            draw_text(&count_cache[states[i].count], x, y, LEFT); // フレームカウント
-            draw_text(direction, x + LOG_X, y, LEFT);             // 方向
+            draw_text(&count_cache[log[i].count], x, y, LEFT); // フレームカウント
+            draw_text(direction, x + LOG_X_FIX, y, LEFT);      // 方向
             Vector2 dirSize = MeasureTextEx(font, direction->text, FONT_SIZE, 1);
-            draw_text(buttons, x + LOG_X + dirSize.x, y, LEFT); // ボタン
+            draw_text(buttons, x + LOG_X_FIX + dirSize.x, y, LEFT); // ボタン
         }
     }
 }
 
+// 非アクティブ時のボタンの色
+// ネオジオのボタン色と配置にあわせたものにしている。
+static Color BTN_COL_INACTIVE = (Color){0x80, 0x80, 0x80, 0xFF}; // #808080FF
+static Color BTN_COL_A2 = (Color){0x60, 0, 0, 0xFF};             // #600000FF
+static Color BTN_COL_B2 = (Color){0x60, 0x60, 0, 0xFF};          // #606000FF
+static Color BTN_COL_C2 = (Color){0, 0x60, 0, 0xFF};             // #006000FF
+static Color BTN_COL_D2 = (Color){0, 0x60, 0x60, 0xFF};          // #006060FF
+
 /**
  * @brief draw_stick_and_buttonsで使用するサブ関数でボタンラベルと円を表示する。
  */
-static void draw_button_label(int btn_index, bool active, int x, int y)
+static void draw_button_label(int btn_index, int btn, int x, int y)
 {
-    Color color = active ? (Color){255, 255, 255, 255} : (Color){128, 128, 128, 255};
+    bool active = btn & btn_index;
+    Color color = BLACK;
     if (btn_index == 0x1)
-        color = active ? RED : (Color){96, 0, 0, 255};
+        color = active ? RED : BTN_COL_A2;
     else if (btn_index == 0x2)
-        color = active ? GOLD : (Color){96, 96, 0, 255};
+        color = active ? GOLD : BTN_COL_B2;
     else if (btn_index == 0x4)
-        color = active ? LIME : (Color){0, 96, 0, 255};
+        color = active ? LIME : BTN_COL_C2;
     else if (btn_index == 0x8)
-        color = active ? SKYBLUE : (Color){0, 96, 96, 255};
+        color = active ? SKYBLUE : BTN_COL_D2;
     else
         return;
-    DrawCircleV((Vector2){x, y}, 18, color);
-    draw_text(&button_cache[btn_index], x, y - FONT_SIZE / 2 + 2, CENTER);
+    DrawCircleV((Vector2){x, y}, BTN_SIZE, color);
+    draw_text(&button_cache[btn_index], x, y - BTN_Y_FIX, CENTER);
 }
 
 /**
@@ -368,22 +459,23 @@ static Vector2 stick_vector_cache2[16];
 /**
  * @brief レバーとボタンの入力状態をビジュアル表現する。
  */
-static void draw_stick_and_buttons(const InputState *state, int base_x, int baseY, InputState *history, Vector2 *stick_vector_cache)
+static void draw_stick_and_buttons(const LogState *log, int base_x, int baseY, unsigned int *trajectory, Vector2 *stick_vector_cache)
 {
     int x = base_x + 80;
     DrawRectangleRounded((Rectangle){base_x - 45, baseY - 45, 90, 90}, 0.3f, 8, WHITE);
-    for (int i = TRAJECTORY_LENGTH - 1; i > 0; i--)
+    for (int i = MAX_TRAJECTORY - 1; i > 0; i--)
     {
-        Vector2 p1 = stick_vector_cache[history[i].dir_index];
-        Vector2 p2 = stick_vector_cache[history[i - 1].dir_index];
-        Color c = (Color){128 + 127 * i / TRAJECTORY_LENGTH, 0, 255 - 127 * i / TRAJECTORY_LENGTH, 255};
+        Vector2 p1 = stick_vector_cache[trajectory[i]];
+        Vector2 p2 = stick_vector_cache[trajectory[i - 1]];
+        // #FF0080FF ~ #8000FFFF
+        Color c = (Color){0x80 + 0x7F * i / MAX_TRAJECTORY, 0, 0xFF - 0x7F * i / MAX_TRAJECTORY, 0xFF};
         DrawLineEx(p1, p2, 12, c);
     }
-    DrawCircleV(stick_vector_cache[state->dir_index], 14, RED);
-    draw_button_label(0x1, state->a, x, baseY);
-    draw_button_label(0x2, state->b, x + 28, baseY - 25);
-    draw_button_label(0x4, state->c, x + 64, baseY - 32);
-    draw_button_label(0x8, state->d, x + 100, baseY - 30);
+    DrawCircleV(stick_vector_cache[log->dir_index], 14, RED);
+    draw_button_label(0x1, log->btn_index, x, baseY);
+    draw_button_label(0x2, log->btn_index, x + 28, baseY - 25);
+    draw_button_label(0x4, log->btn_index, x + 64, baseY - 32);
+    draw_button_label(0x8, log->btn_index, x + 100, baseY - 30);
 }
 
 /**
@@ -423,16 +515,16 @@ static int *codepoint_remove_duplicates(int *codepoints, int codepoint_count, in
 /**
  * @brief 4ビットで上下左右状態を表現したデータを返す。
  */
-static unsigned char conv_dir_index(bool up, bool down, bool left, bool right)
+static inline unsigned char conv_dir_index(const InputState *state)
 {
     unsigned char dir_index = 0;
-    if (up)
+    if (state->up)
         dir_index |= 0x1;
-    if (down)
+    if (state->down)
         dir_index |= 0x2;
-    if (left)
+    if (state->left)
         dir_index |= 0x4;
-    if (right)
+    if (state->right)
         dir_index |= 0x8;
     return dir_index;
 }
@@ -440,16 +532,16 @@ static unsigned char conv_dir_index(bool up, bool down, bool left, bool right)
 /**
  * @brief 4ビットでABCDボタン状態を表現したデータを返す。
  */
-static unsigned char conv_button_index(bool a, bool b, bool c, bool d)
+static inline unsigned char conv_button_index(const InputState *state)
 {
     unsigned char btn_index = 0;
-    if (a)
+    if (state->a)
         btn_index |= 0x1;
-    if (b)
+    if (state->b)
         btn_index |= 0x2;
-    if (c)
+    if (state->c)
         btn_index |= 0x4;
-    if (d)
+    if (state->d)
         btn_index |= 0x8;
     return btn_index;
 }
@@ -457,10 +549,9 @@ static unsigned char conv_button_index(bool a, bool b, bool c, bool d)
 /**
  * @brief 最新の入力データを1000FPSでメモリに記録して状態管理スレッドに移譲する。
  */
-void *input_thread(void *arg)
+static void *input_thread(void *arg)
 {
     struct timespec interval = {.tv_sec = 0, .tv_nsec = 1000000}; // 1ms
-    InputState new_state1 = (InputState){0}, new_state2 = (InputState){0};
 
     printf("[info] state_thread started\n");
 
@@ -502,24 +593,15 @@ void *input_thread(void *arg)
         bool c2 = IsKeyDown(KEY_KP_3);
         bool d2 = IsKeyDown(KEY_KP_4);
 
-        new_state1 = (InputState){
-            up1, down1, left1, right1,
-            a1, b1, c1, d1,
-            conv_dir_index(up1, down1, left1, right1),
-            conv_button_index(a1, b1, c1, d1),
-            0};
-        new_state2 = (InputState){
-            up2, down2, left2, right2,
-            a2, b2, c2, d2,
-            conv_dir_index(up2, down2, left2, right2),
-            conv_button_index(a2, b2, c2, d2),
-            0};
-
         // 状態更新スレッドへ値連携
         if (pthread_mutex_lock(&input_lock) == 0)
         {
-            realtime_state1 = new_state1;
-            realtime_state2 = new_state2;
+            realtime_state1 = (InputState){
+                up1, down1, left1, right1,
+                a1, b1, c1, d1};
+            realtime_state2 = (InputState){
+                up2, down2, left2, right2,
+                a2, b2, c2, d2};
             rt_debug_state = switch_debug;
 
             pthread_mutex_unlock(&input_lock);
@@ -536,35 +618,66 @@ void *input_thread(void *arg)
 }
 
 /**
+ * @brief 直前の入力データと比較して同値ならフレームカウンタを更新し、異なればログを追加する。
+ *        LogState *log : 更新対象のログ（log_1 や log_2）配列
+ *        const LogState *new_log : 新しい入力データ
+ *        unsigned int *no_op_count : 継続カウント用変数
+ *        // 呼び出し例（state_thread内）
+ *        update_log_and_count(log_1, &new_log1, &no_op_count1);
+ *        update_log_and_count(log_2, &new_log2, &no_op_count2);
+ */
+static inline void update_log_and_count(LogState *log, const LogState *new_log, unsigned int *no_op_count)
+{
+
+    if (is_equal_state(new_log, &log[0]))
+    {
+        if (is_neutral(new_log))
+        {
+            // ニュートラル継続によるリセットカウントを加算
+            if (*no_op_count != -1 && *no_op_count < RESET_FRAME_COUNT)
+                (*no_op_count)++;
+        }
+
+        // 継続カウントを加算
+        if (log[0].count < MAX_FRAME_COUNT)
+            log[0].count++;
+    }
+    else
+    {
+        // 入力変更によるログ記録とカウンタリセット
+        memmove(&log[1], &log[0], sizeof(LogState) * (MAX_LOG - 1));
+        log[0] = *new_log;
+        *no_op_count = 1;
+    }
+}
+
+/**
+ * @brief 描画スレッドへの値引き渡し関数です。
+ */
+static inline void copy_drawable_set(
+    unsigned int *dest_traj, const unsigned int *src_traj,
+    LogState *dest_log, const LogState *src_log,
+    bool *active_flag, int no_op_count)
+{
+    memcpy(dest_traj, src_traj, MAX_TRAJECTORY * sizeof(unsigned int)); // 軌跡
+    memcpy(dest_log, src_log, MAX_LOG * sizeof(LogState));              // 入力ログ
+    *active_flag = (no_op_count != -1);                                 // 描画可否を渡す
+}
+
+/**
  * @brief 入力データを60FPSで状態保存する。
  */
 void *state_thread(void *arg)
 {
     struct timespec interval = {.tv_sec = 0, .tv_nsec = 16666666}; // 60FPS
 
-    unsigned int temp_count1 = 0, temp_count2 = 0;
     int no_op_count1 = -1, no_op_count2 = -1;
     InputState current_state1 = {0}, current_state2 = {0};
-    InputState prev_state1 = {0}, prev_state2 = {0};
-    InputState trajectory1[TRAJECTORY_LENGTH] = {0};
-    InputState trajectory2[TRAJECTORY_LENGTH] = {0};
-    InputState log_1[MAX_LOG] = {0};
-    InputState log_2[MAX_LOG] = {0};
-
-    // 入力状態とログの初期化
-    current_state1 = prev_state1 = (InputState){0};
-    current_state2 = prev_state2 = (InputState){0};
-    for (int i = 0; i < TRAJECTORY_LENGTH; i++)
-    {
-        trajectory1[i] = (InputState){0};
-        trajectory2[i] = (InputState){0};
-    }
-    for (int i = 0; i < MAX_LOG; i++)
-    {
-        log_1[i] = (InputState){0};
-        log_2[i] = (InputState){0};
-    }
-    current_state1.count = current_state2.count = 1;
+    LogState new_log1 = {0}, new_log2 = {0};
+    unsigned int trajectory1[MAX_TRAJECTORY] = {0};
+    unsigned int trajectory2[MAX_TRAJECTORY] = {0};
+    LogState log_1[MAX_LOG] = {0};
+    LogState log_2[MAX_LOG] = {0};
 
     printf("[info] state_thread started\n");
 
@@ -578,10 +691,6 @@ void *state_thread(void *arg)
         struct timespec frame_start, frame_end;
         clock_gettime(CLOCK_MONOTONIC, &frame_start);
 
-        // 入力検知用の構造体で上書きされるので退避
-        temp_count1 = current_state1.count;
-        temp_count2 = current_state2.count;
-
         // 入力検知スレッドから値連携
         if (pthread_mutex_lock(&input_lock) == 0)
         {
@@ -590,6 +699,16 @@ void *state_thread(void *arg)
             cur_debug_state = rt_debug_state;
 
             pthread_mutex_unlock(&input_lock);
+
+            // ロック外でログ状態構造体へ変換
+            new_log1 = (LogState){
+                conv_dir_index(&current_state1),
+                conv_button_index(&current_state1),
+                1};
+            new_log2 = (LogState){
+                conv_dir_index(&current_state2),
+                conv_button_index(&current_state2),
+                1};
         }
         else
         {
@@ -597,63 +716,32 @@ void *state_thread(void *arg)
             exit(EXIT_FAILURE);
         }
 
-        // 入力検知用の構造体で上書きされたものを復旧
-        no_op_count1 = current_state1.count = temp_count1;
-        no_op_count2 = current_state2.count = temp_count2;
-
         // trajectoryとログ、カウント更新、DELによるリセット処理をここで統合
 
-        // DELキーで初期化
+        // DELキーで状態初期化
         bool delkey = IsKeyPressed(KEY_DELETE);
-        // 30秒間無操作（約1800フレーム）でリセット
-        if (delkey || no_op_count1 >= 1800)
+        if (delkey || no_op_count1 >= RESET_FRAME_COUNT)
         {
-            current_state1 = prev_state1 = (InputState){0};
-            for (int i = 0; i < TRAJECTORY_LENGTH; i++)
-                trajectory1[i] = (InputState){0};
-            for (int i = 0; i < MAX_LOG; i++)
-                log_1[i] = (InputState){0};
+            memset(trajectory1, 0, sizeof(trajectory1));
+            memset(log_1, 0, sizeof(log_1));
             no_op_count1 = delkey ? 0 : -1;
         }
-        if (delkey || no_op_count2 >= 1800)
+        if (delkey || no_op_count2 >= RESET_FRAME_COUNT)
         {
-            current_state2 = prev_state2 = (InputState){0};
-            for (int i = 0; i < TRAJECTORY_LENGTH; i++)
-                trajectory2[i] = (InputState){0};
-            for (int i = 0; i < MAX_LOG; i++)
-                log_2[i] = (InputState){0};
+            memset(trajectory2, 0, sizeof(trajectory2));
+            memset(log_2, 0, sizeof(log_2));
             no_op_count2 = delkey ? 0 : -1;
         }
 
-        // フレームカウントとログ
-        if (is_equal_state(&current_state1, &prev_state1))
-        {
-            if (current_state1.count < MAX_FRAME_COUNT)
-                current_state1.count++;
-            if (no_op_count1 != -1)
-                no_op_count1++;
-        }
-        else
-        {
-            memmove(&log_1[1], &log_1[0], sizeof(InputState) * (MAX_LOG - 1));
-            log_1[0] = prev_state1;
-            current_state1.count = no_op_count1 = 1;
-            prev_state1 = current_state1;
-        }
-        if (is_equal_state(&current_state2, &prev_state2))
-        {
-            if (current_state2.count < MAX_FRAME_COUNT)
-                current_state2.count++;
-            if (no_op_count2 != -1)
-                no_op_count2++;
-        }
-        else
-        {
-            memmove(&log_2[1], &log_2[0], sizeof(InputState) * (MAX_LOG - 1));
-            log_2[0] = prev_state2;
-            current_state2.count = no_op_count2 = 1;
-            prev_state2 = current_state2;
-        }
+        // レバー軌跡更新
+        memmove(&trajectory1[1], &trajectory1[0], sizeof(unsigned int) * (MAX_TRAJECTORY - 1));
+        trajectory1[0] = new_log1.dir_index;
+        memmove(&trajectory2[1], &trajectory2[0], sizeof(unsigned int) * (MAX_TRAJECTORY - 1));
+        trajectory2[0] = new_log2.dir_index;
+
+        // 最新ログのフレームカウント加算かログ更新
+        update_log_and_count(log_1, &new_log1, &no_op_count1);
+        update_log_and_count(log_2, &new_log2, &no_op_count2);
 
         // デバッグフラグ更新
         if (cur_debug_state && !prev_debug_state && !debug_triggered)
@@ -662,29 +750,20 @@ void *state_thread(void *arg)
             debug_triggered = true;
         }
         if (!cur_debug_state)
-        {
             debug_triggered = false;
-        }
         prev_debug_state = cur_debug_state;
-
-        // 軌跡更新
-        memmove(&trajectory1[1], &trajectory1[0], sizeof(InputState) * (TRAJECTORY_LENGTH - 1));
-        trajectory1[0] = current_state1;
-        memmove(&trajectory2[1], &trajectory2[0], sizeof(InputState) * (TRAJECTORY_LENGTH - 1));
-        trajectory2[0] = current_state2;
 
         // 描画スレッドへ値連携
         if (pthread_mutex_lock(&state_lock) == 0)
         {
-            drawable_state1 = current_state1;
-            memcpy(drawable_traj1, trajectory1, sizeof(trajectory1));
-            memcpy(drawableLogP1, log_1, sizeof(log_1));
-            drawable1 = (no_op_count1 != -1);
-
-            drawable_state2 = current_state2;
-            memcpy(drawable_traj2, trajectory2, sizeof(trajectory2));
-            memcpy(drawableLogP2, log_2, sizeof(log_2));
-            drawable2 = (no_op_count2 != -1);
+            copy_drawable_set(
+                drawable_traj1, trajectory1,
+                drawable_log1, log_1,
+                &drawable1, no_op_count1);
+            copy_drawable_set(
+                drawable_traj2, trajectory2,
+                drawable_log2, log_2,
+                &drawable2, no_op_count2);
 
             pthread_mutex_unlock(&state_lock);
         }
@@ -707,6 +786,19 @@ void *state_thread(void *arg)
         }
     }
     return NULL;
+}
+
+/**
+ * @brief 状態スレッドからの値引き受け取り関数です。
+ */
+static inline void recv_drawable_set(
+    unsigned int *dest_traj, const unsigned int *src_traj,
+    LogState *dest_log, const LogState *src_log,
+    bool *active_flag, bool *src_active)
+{
+    memcpy(dest_traj, src_traj, MAX_TRAJECTORY * sizeof(unsigned int)); // 軌跡
+    memcpy(dest_log, src_log, MAX_LOG * sizeof(LogState));              // 入力ログ
+    *active_flag = *src_active == true;                                 // 描画可否を渡す
 }
 
 /**
@@ -737,7 +829,6 @@ int main()
     int *codepoints_no_dups = codepoint_remove_duplicates(codepoints, codepoint_count, &codepoints_no_dups_count);
     UnloadCodepoints(codepoints);
     font = LoadFontEx(FONT_PATH, FONT_SIZE, codepoints_no_dups, codepoints_no_dups_count);
-    font2 = LoadFontEx(FONT_PATH, FONT_SIZE + 2, codepoints_no_dups, codepoints_no_dups_count);
     SetTextureFilter(font.texture, TEXTURE_FILTER_BILINEAR);
     free(codepoints_no_dups);
 
@@ -751,9 +842,7 @@ int main()
         return 1;
     }
     else
-    {
         printf("[info] input_thread created\n");
-    }
     pthread_t state_tid;
     if (pthread_create(&state_tid, &attr, state_thread, NULL) != 0)
     {
@@ -761,9 +850,7 @@ int main()
         return 1;
     }
     else
-    {
         printf("[info] state_thread created\n");
-    }
     pthread_attr_destroy(&attr);
 
     struct sched_param param;
@@ -772,33 +859,22 @@ int main()
 
     SetTargetFPS(60);
 
-    InputState draw_state1 = (InputState){0}, draw_state2 = (InputState){0};
-    InputState draw_trajectory1[TRAJECTORY_LENGTH] = {0};
-    InputState draw_trajectory2[TRAJECTORY_LENGTH] = {0};
-    InputState draw_log1[MAX_LOG] = {0};
-    InputState draw_log2[MAX_LOG] = {0};
-    bool draw1, draw2;
-
-    // 入力状態とログの初期化
-    for (int i = 0; i < TRAJECTORY_LENGTH; i++)
-    {
-        draw_trajectory1[i] = (InputState){0};
-        draw_trajectory2[i] = (InputState){0};
-    }
-    for (int i = 0; i < MAX_LOG; i++)
-    {
-        draw_log1[i] = (InputState){0};
-        draw_log2[i] = (InputState){0};
-    }
-    draw_state1.count = draw_state2.count = 1;
+    unsigned int draw_trajectory1[MAX_TRAJECTORY] = {0};
+    unsigned int draw_trajectory2[MAX_TRAJECTORY] = {0};
+    LogState draw_log1[MAX_LOG] = {0};
+    LogState draw_log2[MAX_LOG] = {0};
+    bool draw1 = true, draw2 = true;
 
     printf("[info] main_thread started\n");
 
-    bool first = true;
+    // グラデーション用カラー
+    Color bg1 = (Color){0xC8, 0xC8, 0xC8, 0x30}; // #C8C8C830
+    Color bg2 = (Color){0xC8, 0xC8, 0xC8, 0x18}; // #C8C8C818
+    Color bg3 = (Color){0xC8, 0xC8, 0xC8, 0x00}; // #C8C8C800
 
-    Color bg1 = (Color){200, 200, 200, 48};
-    Color bg2 = (Color){200, 200, 200, 24};
-    Color bg3 = (Color){200, 200, 200, 0};
+    // レバー位置キャッシュ
+    init_stick_vector_cache(stick_vector_cache1, STATUS_X1, STATUS_Y, LINE_HEIGHT); // 1P
+    init_stick_vector_cache(stick_vector_cache2, STATUS_X2, STATUS_Y, LINE_HEIGHT); // 2P
 
     while (!WindowShouldClose() && !exit_requested)
     {
@@ -808,15 +884,14 @@ int main()
         // 状態更新スレッドから値連携
         if (pthread_mutex_lock(&state_lock) == 0)
         {
-            draw_state1 = drawable_state1;
-            memcpy(draw_trajectory1, drawable_traj1, sizeof(drawable_traj1));
-            memcpy(draw_log1, drawableLogP1, sizeof(drawableLogP1));
-            draw1 = drawable1;
-
-            draw_state2 = drawable_state2;
-            memcpy(draw_trajectory2, drawable_traj2, sizeof(drawable_traj2));
-            memcpy(draw_log2, drawableLogP2, sizeof(drawableLogP2));
-            draw2 = drawable2;
+            recv_drawable_set(
+                draw_trajectory1, drawable_traj1,
+                draw_log1, drawable_log1,
+                &draw1, &drawable1);
+            recv_drawable_set(
+                draw_trajectory2, drawable_traj2,
+                draw_log2, drawable_log2,
+                &draw2, &drawable2);
 
             pthread_mutex_unlock(&state_lock);
         }
@@ -828,32 +903,28 @@ int main()
 
         BeginDrawing();
 
+        // 背景色
         ClearBackground(BLACK); // #000000 キーカラー
-        DrawRectangleGradientH(0, 0, BG1_WIDTH, SCREEN_HEIGHT, bg1, bg2);
-        DrawRectangleGradientH(BG1_WIDTH, 0, BG2_WIDTH, SCREEN_HEIGHT, bg2, bg3);
-        DrawRectangleGradientH(SCREEN_WIDTH - BG1_WIDTH, 0, BG1_WIDTH, SCREEN_HEIGHT, bg2, bg1);
-        DrawRectangleGradientH(SCREEN_WIDTH - BG1_WIDTH - BG2_WIDTH, 0, BG2_WIDTH, SCREEN_HEIGHT, bg3, bg2);
 
-        if (first)
-        {
-            first = false;
-            init_stick_vector_cache(stick_vector_cache1, 80, 980, LINE_HEIGHT);   // 1P
-            init_stick_vector_cache(stick_vector_cache2, 1680, 980, LINE_HEIGHT); // 2P
-        }
-        draw_stick_and_buttons(&draw_state1, 80, 980, draw_trajectory1, stick_vector_cache1);
-        draw_stick_and_buttons(&draw_state2, 1680, 980, draw_trajectory2, stick_vector_cache2);
-
+        // 背景グラデーション
+        // レバー位置とボタン状態の描画
+        // キーログの描画
         if (draw1)
         {
-            draw_logs(&draw_state1, 40, STATUS_Y, LEFT, 1);
-            draw_logs(draw_log1, 40, LOG_Y, LEFT, MAX_LOG);
+            DrawRectangleGradientH(0, 0, BG1_WIDTH, SCREEN_HEIGHT, bg1, bg2);
+            DrawRectangleGradientH(BG1_WIDTH, 0, BG2_WIDTH, SCREEN_HEIGHT, bg2, bg3);
+            draw_stick_and_buttons(&draw_log1[0], STATUS_X1, STATUS_Y, draw_trajectory1, stick_vector_cache1);
+            draw_logs(draw_log1, LOG_X1, LOG_Y, LEFT, MAX_LOG);
         }
         if (draw2)
         {
-            draw_logs(&draw_state2, 1860, STATUS_Y, RIGHT, 1);
-            draw_logs(draw_log2, 1860, LOG_Y, RIGHT, MAX_LOG);
+            DrawRectangleGradientH(SCREEN_WIDTH - BG1_WIDTH, 0, BG1_WIDTH, SCREEN_HEIGHT, bg2, bg1);
+            DrawRectangleGradientH(SCREEN_WIDTH - BG1_WIDTH - BG2_WIDTH, 0, BG2_WIDTH, SCREEN_HEIGHT, bg3, bg2);
+            draw_stick_and_buttons(&draw_log2[0], STATUS_X2, STATUS_Y, draw_trajectory2, stick_vector_cache2);
+            draw_logs(draw_log2, LOG_X2, LOG_Y, RIGHT, MAX_LOG);
         }
 
+        // デバッグ表示
         if (show_debug)
             DrawFPS(10, 10);
 
@@ -866,7 +937,6 @@ int main()
     pthread_join(state_tid, NULL);
 
     UnloadFont(font);
-    UnloadFont(font2);
     cleanup_codepoint_cache();
     CloseWindow();
 

@@ -21,6 +21,23 @@ JAMMA to xinputであるJAMMAアダプタを対象にしたマッピングとし
 | スタートボタン | 1 | 2 |
 | コイン(セレクト)ボタン | 5 | 6 |
 
+## 使用機器
+
+JAMMA to xpinputアダプタ: Aliexpressなどで購入できます。
+写真ではCHAMMA接続にならないように絶縁しています。
+![JAMMA to xpinput](/doc/adapter.jpg)
+
+キーボードモードでの利用を想定しているのでスイッチをセットします。
+![Keyboad Switch](/doc/adapter.jpg)
+
+## 利用イメージ
+
+本ツールだけの出力は黒背景の表示になります。
+![Tool only](/doc/bsk1.png)
+
+バックストリームキー合成後のイメージです。
+![BSK](/doc/bsk2.png)
+
 ## インストール方法
 
 ### 1. 必要パッケージを導入
