@@ -1,0 +1,6 @@
+project(input_dispi)
+cmake_minimum_required(VERSION 3.25)
+include_directories(/usr/local/include)
+link_directories(/usr/local/lib)
+add_executable(input_dispi src/input_dispi.c)
+target_link_libraries(input_dispi raylib m)
