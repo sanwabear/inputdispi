@@ -1,5 +1,6 @@
 #!/bin/bash
 set -e
+set -x
 
 echo "=== raylib のビルドとインストールを開始します ==="
 
@@ -20,8 +21,10 @@ fi
 
 # ビルド用ディレクトリの作成
 cd raylib
+pwd
 mkdir -p build && cd build
-
+pwd
+cmake ..
 sudo make uninstall || true  # 一度アンインストール（失敗してもOK）
 
 make clean
