@@ -812,13 +812,6 @@ int main()
     acquire_lock_or_exit();
     setup_signal_handlers();
 
-    setlocale(LC_CTYPE, "");
-    if (!setlocale(LC_CTYPE, "ja_JP.UTF-8"))
-    {
-        fprintf(stderr, "Failed to set locale ja_JP.UTF-8.\n");
-        return 1;
-    }
-
     SetConfigFlags(FLAG_WINDOW_UNDECORATED | FLAG_FULLSCREEN_MODE);
     InitWindow(SCREEN_WIDTH, SCREEN_HEIGHT, "input_dispi raylib");
 
