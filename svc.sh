@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/bin/bash
 set -e
 set -x
 
@@ -102,21 +102,18 @@ sudo_if_needed systemctl stop "$SERVICE"
 
 echo "Waiting for service to fully stop..."
 
-timeout=5  # 最大待機秒数
+timeout=5     # 最大待機秒数
 interval=0.2  # チェック間隔秒
 
-for ((i=0; i<timeout*5; i++)); do
+loops=$(awk "BEGIN { printf \"%d\", $timeout / $interval }")
+
+for ((i=0; i<loops; i++)); do
     if ! systemctl is-active --quiet "$SERVICE"; then
         echo "Service has fully stopped."
         break
     fi
     sleep "$interval"
 done
-
-if systemctl is-active --quiet "$SERVICE"; then
-    echo "Service did not stop within ${timeout}s. Forcing stop..."
-    sudo_if_needed systemctl kill "$SERVICE"
-fi
 
 # ロックファイル削除
 if [ -e "$LOCK_FILE" ]; then
