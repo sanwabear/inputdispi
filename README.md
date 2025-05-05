@@ -47,6 +47,27 @@ chmod +x *.sh
 ./setup.sh
 ```
 
+#### 1.1 内部フレームレートの変更
+
+ソースでは NEOGEO MVS の59.1856Hzにあわせた設定にしています。
+
+必要であれば、希望の環境にあわせてソースの該当箇所を変更してください。
+
+デフォルト - MVS用(59.1856Hz)
+```c
+    struct timespec interval = INTERVAL_MVS;
+```
+
+AES用(59.599Hz)
+```c
+    struct timespec interval = INTERVAL_AES;
+```
+
+60Hz
+```c
+    struct timespec interval = INTERVAL_60;
+```
+
 ### 2. ソースからビルドとインストール
 
 ```bash

@@ -665,11 +665,19 @@ static inline void copy_drawable_set(
 }
 
 /**
+ * https://wiki.neogeodev.org/index.php?title=Framerate
+ * ネオジオの周波数に合わせた定数を準備しておく。
+ */
+static struct timespec INTERVAL_MVS = {.tv_sec = 0, .tv_nsec = 16896002}; // 59.1856
+static struct timespec INTERVAL_AES = {.tv_sec = 0, .tv_nsec = 16778805}; // 59.599
+static struct timespec INTERVAL_60  = {.tv_sec = 0, .tv_nsec = 16666666}; // 60FPS
+
+/**
  * @brief 入力データを60FPSで状態保存する。
  */
 void *state_thread(void *arg)
 {
-    struct timespec interval = {.tv_sec = 0, .tv_nsec = 16666666}; // 60FPS
+    struct timespec interval = INTERVAL_MVS;
 
     int no_op_count1 = -1, no_op_count2 = -1;
     InputState current_state1 = {0}, current_state2 = {0};
